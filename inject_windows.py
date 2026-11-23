@@ -8,6 +8,11 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# 兼容隔离模式 Python（-I / PYTHONSAFEPATH）：不依赖 sys.path[0]，显式把脚本目录加入搜索路径
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from injector.cli import main
 
 if __name__ == "__main__":

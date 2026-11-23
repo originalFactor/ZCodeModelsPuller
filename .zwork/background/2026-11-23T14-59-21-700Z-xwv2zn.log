@@ -1,0 +1,12 @@
+[OMP Efforts] 本地缓存有效 (有效期 7 天)，跳过下载：omp_efforts.json
+检测到 ZCode 已升级（当前 asar 为新的官方原版），备份已刷新 → 还原将回到这一版。
+解包 app.asar …（约百 MB，可能需要一两分钟）
+  [✔] html     已在 </body> 前挂载启动入口
+  [✔] puller   已复制（覆盖）前端脚本
+  [✔] preload  已扩展 window.zcode（ipcRenderer 持有者：y.ipcRenderer）
+  [✔] main     已注册 8 个 IPC handler（handle 载体：oe）
+打包 app.asar …
+打包自检通过（IPC 标记 2 处、HTML 标记 1 处）。
+已保持 17 项原生模块外置（同步 17 个文件到 app.asar.unpacked）。
+
+注入成功！请完全退出并重新打开 ZCode，进入「设置 → 模型设置 → 自定义供应商」，即可看到「⚡️ 自动拉取模型」按钮。

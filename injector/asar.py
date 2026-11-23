@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 from .config import MARKER_HTML, MARKER_IPC
@@ -31,6 +33,67 @@ def run_npx(sub: str, *args: str) -> tuple[int, str, str]:
     except subprocess.TimeoutExpired:
         die("执行超时（>15 分钟），请重试或检查 Node/pnpm 是否正常。")
     return res.returncode, res.stdout, res.stderr
+
+
+def read_unpacked_paths(asar_path: Path) -> list[str]:
+    """从原版 asar 的 header 读出所有标记为 unpacked 的条目（相对路径，正斜杠）。
+
+    Electron 的 asar 会把原生模块（.node / .dll / .exe）放在同名 `.unpacked` 目录而非包内，
+    重新打包时必须原样保留这些标记，否则原生模块被塞进包内将无法加载。
+    """
+    try:
+        with open(asar_path, "rb") as f:
+            _, _, _, json_len = struct.unpack("<IIII", f.read(16))
+            if json_len <= 0 or json_len > 64 << 20:
+                return []
+            header = json.loads(f.read(json_len).decode("utf-8", errors="replace"))
+    except (OSError, struct.error, ValueError):
+        return []
+
+    paths: list[str] = []
+
+    def walk(node: dict, prefix: str) -> None:
+        for name, child in (node.get("files") or {}).items():
+            p = f"{prefix}/{name}" if prefix else name
+            if "files" in child:
+                walk(child, p)
+            elif child.get("unpacked"):
+                # 只收文件级条目：asar 只会给文件打 unpacked 标记，目录节点不作为比对基准
+                paths.append(p)
+
+    walk(header, "")
+    return paths
+
+
+def pack_asar(work: Path, out: Path, unpack: list[str]) -> tuple[int, str, str]:
+    """把 work 目录打包为 out，并保持 unpack 列表里的条目为外置（unpacked）。
+
+    注意：@electron/asar 的 --unpack glob 是对「绝对路径」做匹配的，因此每条相对路径都要
+    加上 `**/` 前缀才命中；且只接受一个 glob，多条用花括号展开一次性传入。
+    """
+    args = [str(work), str(out)]
+    if unpack:
+        args += ["--unpack", "{" + ",".join(f"**/{p}" for p in unpack) + "}"]
+    return run_npx("pack", *args)
+
+
+def sync_unpacked(new_asar: Path, target_dir: Path) -> int:
+    """把重新打包生成的 `<asar>.unpacked` 目录内容合并进安装目录的 app.asar.unpacked。"""
+    src = new_asar.with_name(new_asar.name + ".unpacked")
+    if not src.is_dir():
+        return 0
+    count = 0
+    try:
+        for item in src.rglob("*"):
+            if not item.is_file():
+                continue
+            dst = target_dir / item.relative_to(src)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, dst)
+            count += 1
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+    return count
 
 
 def backup_asar(asar: Path, bak: Path, dry_run: bool) -> None:

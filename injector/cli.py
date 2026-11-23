@@ -18,8 +18,16 @@ except Exception:
     pass
 
 from gen_omp_efforts import ensure_omp_efforts
-from .asar import backup_asar, run_npx
-from .config import MARKER_HTML, MARKER_IPC, OMP_EFFORTS_FILE, PULLER_JS, ROOT_DIR, default_asar
+from .asar import backup_asar, pack_asar, read_unpacked_paths, run_npx, sync_unpacked
+from .config import (
+    MARKER_HTML,
+    MARKER_IPC,
+    OMP_EFFORTS_FILE,
+    PULLER_JS,
+    ROOT_DIR,
+    _candidate_asars,
+    default_asar,
+)
 from .patcher import copy_puller, node_check_patched, patch_html, patch_main, patch_preload
 from .process import ensure_zcode_not_running
 from .utils import die, info, overwrite_file, scan_bytes, warn
@@ -54,9 +62,23 @@ def ensure_puller_built() -> bool:
     return False
 
 
+def missing_asar_hint(asar: Path) -> str:
+    """找不到 app.asar 时给出已探测过的路径清单，方便用户用 --asar 直接指定。"""
+    tried = [p for p in _candidate_asars() if p != asar]
+    lines = [
+        f"找不到 app.asar：{asar}",
+        "已自动探测以下位置，均不存在：",
+    ]
+    lines += [f"  - {p}" for p in tried[:8]]
+    lines.append("若 ZCode 装在其它位置，请用 --asar 指定，例如：")
+    lines.append(r'  python inject_windows.py --asar "D:\Program Files\ZCode\resources\app.asar"')
+    lines.append(r"或设置环境变量 ZCODE_ASAR 指向该文件。")
+    return "\n".join(lines)
+
+
 def cmd_install(asar: Path, bak: Path, dry_run: bool) -> None:
     if not asar.exists():
-        die(f"找不到 app.asar：{asar}\n可用 --asar 指定路径。")
+        die(missing_asar_hint(asar))
 
     # 自动生成或更新 OMP efforts 档位表（支持有效期与自动更新）
     ensure_omp_efforts(OMP_EFFORTS_FILE)
@@ -85,6 +107,9 @@ def cmd_install(asar: Path, bak: Path, dry_run: bool) -> None:
     if work.exists():
         shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
+    # 打包前先从当前 asar 的 header 读出哪些条目必须保持外置（原生模块 .node/.dll/.exe），
+    # 否则重打包会把它们塞进包内导致 ZCode 加载失败。
+    unpack_paths = read_unpacked_paths(asar)
     try:
         info(f"解包 {asar.name} …（约百 MB，可能需要一两分钟）")
         rc, out, err = run_npx("extract", str(asar), str(work))
@@ -116,16 +141,28 @@ def cmd_install(asar: Path, bak: Path, dry_run: bool) -> None:
         if new_asar.exists():
             new_asar.unlink()
         info("打包 app.asar …")
-        rc, out, err = run_npx("pack", str(work), str(new_asar))
+        rc, out, err = pack_asar(work, new_asar, unpack_paths)
         if rc != 0:
+            shutil.rmtree(new_asar.with_name(new_asar.name + ".unpacked"), ignore_errors=True)
             new_asar.unlink(missing_ok=True)
             die(f"打包失败：{err.strip() or out.strip()}")
 
         counts = scan_bytes(new_asar, [MARKER_IPC, MARKER_HTML])
         if counts[MARKER_IPC] < 2 or counts[MARKER_HTML] < 1:
-            new_asar.unlink()
+            shutil.rmtree(new_asar.with_name(new_asar.name + ".unpacked"), ignore_errors=True)
+            new_asar.unlink(missing_ok=True)
             die(f"打包自检未通过（IPC 标记 {counts[MARKER_IPC]} 处、HTML 标记 {counts[MARKER_HTML]} 处），拒绝替换。")
         info(f"打包自检通过（IPC 标记 {counts[MARKER_IPC]} 处、HTML 标记 {counts[MARKER_HTML]} 处）。")
+
+        if unpack_paths:
+            restored = sync_unpacked(new_asar, asar.parent / "app.asar.unpacked")
+            missing = sorted(set(read_unpacked_paths(new_asar)) ^ set(unpack_paths))
+            if missing:
+                shutil.rmtree(new_asar.with_name(new_asar.name + ".unpacked"), ignore_errors=True)
+                new_asar.unlink(missing_ok=True)
+                die("打包后 native 模块外置清单与原版不一致，拒绝替换（否则 ZCode 原生模块会加载失败）：\n  "
+                    + "\n  ".join(missing[:8]))
+            info(f"已保持 {len(unpack_paths)} 项原生模块外置（同步 {restored} 个文件到 app.asar.unpacked）。")
 
         try:
             os.replace(new_asar, asar)
@@ -167,7 +204,7 @@ def cmd_restore(asar: Path, bak: Path) -> None:
 
 def cmd_check(asar: Path, bak: Path) -> None:
     if not asar.exists():
-        die(f"找不到 app.asar：{asar}\n可用 --asar 指定路径。")
+        die(missing_asar_hint(asar))
     info(f"检查对象：{asar}")
     counts = scan_bytes(asar, ["exposeInMainWorld", "SaveMcpToUserDirectory", MARKER_IPC, MARKER_HTML])
     for needle in ("exposeInMainWorld", "SaveMcpToUserDirectory", MARKER_IPC, MARKER_HTML):
