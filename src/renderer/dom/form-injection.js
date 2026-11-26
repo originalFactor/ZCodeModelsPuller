@@ -254,8 +254,21 @@ export async function addModelsToOfficialForm(ids) {
     }
 
     // 2. 若模型不存在：执行新增逻辑
+    // 2.1 优先：ZCode 4.0+ 官方原子回调签名 onAddPersonalModel(providerId, modelId, config)
+    //     —— 4.0 起供应商活状态由 host 进程内存 store 管理，只有官方回调才能即时生效并写盘
     let addSuccess = false;
-    if (typeof curOnAdd === "function") {
+    if (typeof onAddPersonal === "function" && currentProviderId) {
+      try {
+        await onAddPersonal(currentProviderId, id, cleanPersonal);
+        added++;
+        addSuccess = true;
+      } catch (e) {
+        console.warn("[ZCode-Model-Puller] onAddPersonalModel(4.0 签名) 失败:", e);
+      }
+    }
+
+    // 2.2 兜底：3.x 签名 onAddModel(modelObj)
+    if (!addSuccess && typeof curOnAdd === "function") {
       try {
         await curOnAdd(modelObj);
         added++;
@@ -265,13 +278,14 @@ export async function addModelsToOfficialForm(ids) {
       }
     }
 
+    // 2.3 最后：3.x 签名 onAddPersonalModel(providerId, modelObj)
     if (!addSuccess && typeof onAddPersonal === "function" && currentProviderId) {
       try {
         await onAddPersonal(currentProviderId, modelObj);
         added++;
         addSuccess = true;
       } catch (e2) {
-        console.warn("[ZCode-Model-Puller] onAddPersonalModel 失败:", e2);
+        console.warn("[ZCode-Model-Puller] onAddPersonalModel(3.x 签名) 失败:", e2);
       }
     }
   }
@@ -389,7 +403,39 @@ export async function syncModelsToOfficialConfig({
 }) {
   const providerId = currentProviderId || getCurrentProviderId() || "custom";
 
-  // 1. 首选：极速直写配置文件（单次原子 IO，毫秒级响应，跳过慢速逐个循环）
+  // 1. 首选：官方原子回调（Fiber 逐个）。
+  //    ZCode 4.0+ 的供应商活状态由 host 进程内存 store 管理，provider_config.json 只是持久化投影；
+  //    直写文件不会被活状态即时吸收（表现为「写进去了但界面不显示」），必须走官方回调。
+  console.log("[ZCode-Model-Puller] 正在走官方原子回调模式...");
+  let deletedCount = 0;
+  for (const id of toDelete) {
+    try {
+      await deleteModelFromOfficialForm(id, providerId);
+      deletedCount++;
+    } catch (e) {
+      console.warn(`[ZCode-Model-Puller] 删除模型 ${id} 失败:`, e);
+    }
+  }
+
+  let addResult = { ok: false, added: 0, overwritten: 0 };
+  try {
+    addResult = await addModelsToOfficialForm([...toAdd, ...toOverwrite]);
+  } catch (e) {
+    console.warn("[ZCode-Model-Puller] 官方回调批量添加异常:", e);
+  }
+
+  if (addResult.ok || addResult.added > 0 || addResult.overwritten > 0 || deletedCount > 0) {
+    triggerDirectReload();
+    return {
+      ok: addResult.ok || deletedCount > 0,
+      direct: false,
+      added: addResult.added || 0,
+      overwritten: addResult.overwritten || 0,
+      deleted: deletedCount,
+    };
+  }
+
+  // 2. 兜底：官方回调完全不可用（极老版本）时，极速直写配置文件（单次原子 IO）
   try {
     const api = getZCodeApi();
     if (api && api.readConfigFile && api.writeConfigFile) {
@@ -522,9 +568,9 @@ export async function syncModelsToOfficialConfig({
     console.warn("[ZCode-Model-Puller] 直写配置发生异常，自动回退到逐个操作模式:", directErr);
   }
 
-  // 2. 回退机制：若直写不可用，走 Fiber 逐个操作 (先删后加/Commit)
+  // 3. 最终回退：直写也失败时，走 Fiber 逐个操作 (先删后加/Commit) 尽力而为
   console.log("[ZCode-Model-Puller] 正在走逐个操作回退模式...");
-  let deletedCount = 0;
+  deletedCount = 0;
   for (const id of toDelete) {
     try {
       await deleteModelFromOfficialForm(id, providerId);
@@ -534,7 +580,7 @@ export async function syncModelsToOfficialConfig({
     }
   }
 
-  const addResult = await addModelsToOfficialForm([...toAdd, ...toOverwrite]);
+  addResult = await addModelsToOfficialForm([...toAdd, ...toOverwrite]);
   return {
     ok: addResult.ok || deletedCount > 0,
     added: addResult.added || 0,

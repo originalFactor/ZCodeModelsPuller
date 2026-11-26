@@ -33,31 +33,95 @@ def fetch(url: str, timeout: int = 15) -> bytes:
     return urllib.request.urlopen(req, timeout=timeout).read()
 
 
+def _decode_value(data: dict, value, nodes: list, keys: list, shapes: list, cache: dict):
+    """解码 compact catalog 的单个 EncodedValue（标量原样返回，引用则展开为对象/数组）。"""
+    if not isinstance(value, list):
+        return value
+    node_id = value[0] if value else -1
+    if node_id < 0:
+        return None
+    if node_id in cache:
+        return cache[node_id]
+    node = nodes[node_id]
+    if node[0] == 1:  # ArrayNode
+        out = [_decode_value(data, v, nodes, keys, shapes, cache) for v in node[1]]
+    else:  # ObjectNode: [0, 扁平化的 keyId/value 对, shapeId, 布尔位图]
+        out = {}
+        props = node[1]
+        for i in range(0, len(props), 2):
+            out[keys[props[i]]] = _decode_value(data, props[i + 1], nodes, keys, shapes, cache)
+        shape = shapes[node[2]]
+        masks = node[3] or []
+        for i, key_id in enumerate(shape):
+            word = masks[i >> 5] if (i >> 5) < len(masks) else 0
+            out[keys[key_id]] = bool((word >> (i % 32)) & 1)
+    cache[node_id] = out
+    return out
+
+
+def iter_catalog_models(data: dict):
+    """遍历上游模型目录，产出 (供应商, 模型ID, 模型字典)。
+
+    兼容两种上游格式：
+    - 旧版嵌套字典 {provider: {modelId: {...}}}；
+    - 新版 compact catalog（version=1，keys/nodes/providers 引用编码）。
+    """
+    if isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("providers"), list):
+        keys = data.get("keys") or []
+        shapes = data.get("booleanShapes") or []
+        nodes = data.get("nodes") or []
+        cache: dict = {}
+        for row in data["providers"]:
+            if not isinstance(row, list) or len(row) < 3:
+                continue
+            prov, consts, models = row[0], row[1], row[2]
+            shared = _decode_value(data, consts, nodes, keys, shapes, cache)
+            shared = shared if isinstance(shared, dict) else {}
+            for item in models or []:
+                if not isinstance(item, list) or len(item) < 2:
+                    continue
+                mid, encoded = item[0], item[1]
+                body = _decode_value(data, encoded, nodes, keys, shapes, cache)
+                if not isinstance(body, dict):
+                    continue
+                merged = dict(shared)
+                merged.update(body)
+                merged.setdefault("id", mid)
+                yield prov, mid, merged
+        return
+    if isinstance(data, dict):
+        for prov, mods in data.items():
+            if not isinstance(mods, dict):
+                continue
+            for mid, e in mods.items():
+                if isinstance(e, dict) and isinstance(mid, str) and mid:
+                    yield prov, mid, e
+
+
 def build(data: dict) -> dict:
     out: dict[str, dict] = {}
-    total = hits = 0
-    for prov, mods in data.items():
-        if not isinstance(mods, dict):
+    for prov, mid, e in iter_catalog_models(data):
+        if not isinstance(mid, str) or not mid:
             continue
-        for mid, e in mods.items():
-            if not isinstance(e, dict) or not isinstance(mid, str) or not mid:
-                continue
-            total += 1
-            short = mid.split("/")[-1].strip().lower()
-            if not short:
-                continue
-            r = bool(e.get("reasoning"))
-            th = e.get("thinking")
-            eff = th.get("efforts") if isinstance(th, dict) else None
-            if not r and not eff:
-                continue
-            item: dict = {}
-            if r:
-                item["r"] = 1
-            if eff:
-                item["e"] = eff
-            out[short] = item
-            hits += 1
+        short = mid.split("/")[-1].strip().lower()
+        if not short:
+            continue
+        r = bool(e.get("reasoning"))
+        th = e.get("thinking")
+        if isinstance(th, dict):
+            eff = th.get("efforts")
+        elif isinstance(th, list):
+            eff = th
+        else:
+            eff = None
+        if not r and not eff:
+            continue
+        item: dict = {}
+        if r:
+            item["r"] = 1
+        if eff:
+            item["e"] = eff
+        out[short] = item
     return out
 
 
@@ -70,6 +134,9 @@ def is_expired(path: Path, ttl_days: int = DEFAULT_TTL_DAYS) -> bool:
         meta = obj.get("_metadata") if isinstance(obj, dict) else None
         now_ts = int(time.time() * 1000)
         if meta and isinstance(meta.get("expires_at"), (int, float)):
+            # 旧版生成器遇到上游格式变更时会产出空表（total_models = 0），视为过期强制重取
+            if isinstance(meta.get("total_models"), int) and meta["total_models"] <= 0:
+                return True
             return now_ts >= meta["expires_at"]
         # 旧版没有 _metadata，按文件 mtime 计算
         mtime = path.stat().st_mtime
