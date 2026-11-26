@@ -1,0 +1,13 @@
+{
+  "name": "zcode-model-puller",
+  "skill_identifier": "zcode-model-puller",
+  "version": "1.0.0",
+  "original": true,
+  "repost_source": "",
+  "content_tag_ids": [
+    "1001"
+  ],
+  "bundle_size_bytes": 3085,
+  "bundle_sha256": "139d651182f6d66226548008c43cc924372a783d928029345c3f97d2511d9b8c",
+  "md_length": 2746
+}

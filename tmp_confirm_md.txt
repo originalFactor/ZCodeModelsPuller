@@ -1,0 +1,96 @@
+# ZCodeModelsPuller 操作技能
+
+向 ZCode（Electron 应用，Windows）注入「一键拉取模型 + 元数据补全 + 思考档位管理」能力。本技能指导你安全执行注入/还原/构建/调试全流程。
+
+## 仓库定位
+
+脚本仓库（GitHub）：https://github.com/Su-Loon/ZCodeModelsPuller
+
+使用前先获得本地克隆：
+1. 若本地已有该仓库克隆，直接以克隆根为 workdir
+2. 否则执行 `git clone https://github.com/Su-Loon/ZCodeModelsPuller.git` 获取
+3. 仍找不到时停下询问用户，**绝不猜测路径执行**
+
+所有命令默认以仓库根为 workdir 执行。
+
+## 硬性约束（违反即失败）
+
+1. **注入前 ZCode 必须完全退出**（含托盘进程）。注入器会自动检查，若报「ZCode 正在运行」需先结束进程，不要绕过。
+2. **绝不硬编码 minifier 变量名**：ZCode 更新后官方压缩变量名会漂移。改动 `patcher.py` 相关代码时，锚点一律使用运行时宽容正则（`RE_*_ANCHOR`）。
+3. **不兼容即中止**：锚点正则不命中时注入器会报「版本不兼容」并拒绝产出坏包。这是预期行为，不要用 `--force` 类方式强行绕过（也没有这个选项）。
+4. **思考档位严格依赖 `omp_efforts.json`**：模型在 OMP 表中无 efforts 时明确报错属预期，禁止伪造档位或引入内置家族表兜底。
+5. **构建产物不入库**：`zcode-model-puller.js` 与 `omp_efforts.json` 被 `.gitignore` 排除，勿提交。
+
+## 场景 A：注入
+
+```bash
+# 1. 演练：验证三层锚点可命中，不改动任何文件
+python inject_windows.py --dry-run
+
+# 2. 正式注入（自动自愈：omp_efforts.json 缺失/过期则拉取；前端产物缺失则自动构建）
+python inject_windows.py
+```
+
+- dry-run 报「版本不兼容/锚点未命中」→ 转「排障」节，不要直接正式注入。
+- 注入成功后必须提醒用户：**重启 ZCode 才生效**。
+- 仅查看当前注入状态：`python inject_windows.py --check`。
+
+## 场景 B：还原
+
+```bash
+python inject_windows.py --restore
+```
+
+同样要求 ZCode 已退出。还原使用 `app.asar.original.bak` 备份（哈希校验）。
+
+## 场景 C：更新思考档位表
+
+```bash
+python gen_omp_efforts.py          # 默认 7 天 TTL，未过期则跳过
+python gen_omp_efforts.py --force  # 强制重新拉取
+```
+
+- 网络失败会优雅回退本地缓存；若缓存也不存在则报错，如实告知用户，不要编造档位数据。
+
+## 场景 D：改动代码后的自检
+
+改前端（`src/renderer/**`）后：
+
+```bash
+pnpm run build && node --check zcode-model-puller.js
+```
+
+改主进程注入 JS（`injector/main_handlers.js`）或 `patcher.py` 后：
+
+```bash
+python -m py_compile injector/patcher.py
+python inject_windows.py --dry-run
+```
+
+## 场景 E：注入后调试
+
+1. 确认已注入并重启 ZCode，以 `--remote-debugging-port=9333` 启动
+2. 通过 CDP 连接 page target（`http://localhost:9333/json`）执行 `Runtime.evaluate`、`Input.dispatchMouseEvent`、`Page.captureScreenshot`
+3. 临时调试脚本命名 `cdp_*.js`、截图 `.png`，**用完即删，勿提交**（已被 .gitignore 排除）
+
+## 排障速查
+
+| 现象 | 处理 |
+|---|---|
+| 「ZCode 正在运行」 | 结束 ZCode 全部进程（含托盘）后重试 |
+| 「版本不兼容 / 锚点未命中」 | ZCode 大版本更新导致。先 `--restore` 还原旧注入，再分析新版 asar 中锚点结构，更新 `patcher.py` 的 `RE_*_ANCHOR` 后重试 |
+| 注入后界面无变化 | 确认已重启；`--check` 确认三层标记存在；CDP 检查 `zcode-model-puller.js` 是否加载 |
+| 档位报错「OMP 中无 efforts」 | 预期行为。`gen_omp_efforts.py --force` 更新表；仍无则该模型确实不受支持，如实告知 |
+| 聊天侧档位列表未刷新 | 已知机制：档位列表是选模型时的快照，需先切同组另一模型再切回（`dom/radix-simulate.js` 已自动处理） |
+| 跨版本升级后异常 | `--restore` 后重新注入（备份会自动刷新为最新原版） |
+
+## 幂等性说明
+
+已注入的层靠标记（`MARKER_HTML` / `MARKER_IPC`）跳过，重复执行注入安全；renderer 脚本每次强制覆盖为最新构建产物。
+
+## 关键架构背景（改代码前必读）
+
+- 三层注入：renderer（`index.html` 挂脚本）/ preload（运行时正则扩展 `window.zcode`，8 个 IPC API）/ main（注册 IPC handler，内嵌档位表）
+- 前端为 Preact + JSX 组件化结构（`src/renderer/`），CSS 与 CEL 表达式外部文件化，esbuild 以 text loader 内联
+- 合成事件无 `isTrusted` 打不开 Radix 浮层，模拟点击必须走主进程 `webContents.sendInputEvent`
+- 详细架构见仓库 `AGENTS.md` 与 `README.md`
